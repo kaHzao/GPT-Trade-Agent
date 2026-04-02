@@ -1,0 +1,70 @@
+name: Perps Trading Agent GPT
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Jupiter CLI v0.6.0
+        run: npm install -g @jup-ag/cli@0.6.0
+
+      - name: Setup wallet key
+        env:
+          JUP_PRIVATE_KEY: ${{ secrets.JUP_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.config/jup/keys
+          node -e "
+            const key = process.env.JUP_PRIVATE_KEY.trim();
+            const fs = require('fs');
+            const home = process.env.HOME;
+            fs.writeFileSync(home + '/.config/jup/keys/default.json', key);
+            fs.writeFileSync(home + '/.config/jup/settings.json', JSON.stringify({ activeKey: 'default' }));
+            console.log('Key ready');
+          "
+          test -f ~/.config/jup/keys/default.json && echo "Key file verified ✅"
+
+      - name: Restore agent state
+        uses: actions/cache@v4
+        with:
+          path: |
+            risk-guard.json
+            positions-tracker.json
+          key: agent-gpt-state-${{ github.repository }}
+          restore-keys: |
+            agent-gpt-state-${{ github.repository }}
+
+      - name: Run trading agent
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COLLATERAL_USDC: ${{ vars.COLLATERAL_USDC }}
+          LEVERAGE: ${{ vars.LEVERAGE }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+        run: npm run trade
+
+      - name: Save agent state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            risk-guard.json
+            positions-tracker.json
+          key: agent-gpt-state-${{ github.repository }}-${{ github.run_id }}
