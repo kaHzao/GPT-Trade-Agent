@@ -6,13 +6,15 @@
     "trade": "ts-node src/index.ts"
   },
   "dependencies": {
+    "@types/node-telegram-bot-api": "^0.64.14",
     "axios": "^1.6.0",
-    "technicalindicators": "^3.1.0",
-    "dotenv": "^16.0.0"
+    "dotenv": "^16.0.0",
+    "node-telegram-bot-api": "^0.67.0",
+    "technicalindicators": "^3.1.0"
   },
   "devDependencies": {
-    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
     "ts-node": "^10.9.0",
-    "@types/node": "^20.0.0"
+    "typescript": "^5.0.0"
   }
 }
