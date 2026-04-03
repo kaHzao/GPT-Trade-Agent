@@ -5,52 +5,35 @@ export type Asset = 'SOL' | 'BTC' | 'ETH';
 export const ASSETS: Asset[] = ['SOL', 'BTC', 'ETH'];
 
 export const config = {
-  binance: {
-    baseUrl: 'https://api.binance.com',
-    symbols: {
-      SOL: 'SOLUSDT',
-      BTC: 'BTCUSDT',
-      ETH: 'ETHUSDT',
-    } as Record<Asset, string>,
-  },
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
-    chatId: process.env.TELEGRAM_CHAT_ID || '',
+    chatId:   process.env.TELEGRAM_CHAT_ID   || '',
   },
+
   trading: {
     collateralUsdc: parseFloat(process.env.COLLATERAL_USDC || '10'),
-    leverage: parseFloat(process.env.LEVERAGE || '2'),
-    dryRun: process.env.DRY_RUN !== 'false',
+    leverage:       parseFloat(process.env.LEVERAGE        || '2'),
+    dryRun:         process.env.DRY_RUN !== 'false',
   },
+
   ta: {
-    // EMA (upgraded to 20/50 — smoother, less noise)
-    emaFast: 20,
-    emaSlow: 50,
+    // ── ATR ──────────────────────────────────────────────────────────────────
+    atrPeriod:       14,
+    atrMultiplier:   1.5,   // SL = ATR(1h) × 1.5  ← FIX: pakai 1h
+    atrTpMultiplier: 3.3,   // TP = ATR(1h) × 3.3  → RR ~2.2
 
-    // RSI
-    rsiPeriod: 14,
-    rsiBuyMin: 45,       // LONG entry RSI min
-    rsiBuyMax: 65,       // LONG entry RSI max
-    rsiShortMin: 35,     // SHORT entry RSI min
-    rsiShortMax: 55,     // SHORT entry RSI max
-    rsiSellMin: 72,      // Overbought trigger
+    // ── Volatility filter (pakai ATR% dari 30m) ───────────────────────────
+    volMinPct: 0.003,  // terlalu sepi = skip
+    volMaxPct: 0.025,  // terlalu liar = skip
 
-    // ATR
-    atrPeriod: 14,
-    atrMultiplier: 1.5,
+    // ── Market structure ──────────────────────────────────────────────────
+    swingLookback: 6,   // jumlah candle 4h untuk detect swing high/low
 
-    // ADX (regime detection)
-    adxThreshold: 20,           // ADX > 20 = trending
-    atrSidewaysThreshold: 1.0,  // ATR% > 1 = enough movement
+    // ── Breakout candle filter ────────────────────────────────────────────
+    bodyMultiplier: 1.0,  // body candle >= avg × 1.0 (tidak terlalu ketat)
 
-    // Bollinger Bands
-    bbPeriod: 20,
-    bbStdDev: 2,
-
-    // General
-    volumeMultiplier: 1.3,
-    swingLookback: 10,
-    minRR: 2.0,          // R:R 1:2 (aligned with GPT suggestion)
-    minConfidence: 60,
+    // ── Confidence & R:R ─────────────────────────────────────────────────
+    minConfidence: 65,   // naik dari 60
+    minRR:         2.0,
   },
 };
