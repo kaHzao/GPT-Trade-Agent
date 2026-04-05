@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "description": "Jupiter Perps Trading Agent - GPT TA Strategy",
   "scripts": {
-    "trade": "ts-node src/index.ts"
+    "trade": "ts-node src/index.ts",
+    "summary": "ts-node src/summary.ts"
   },
   "dependencies": {
     "@types/node-telegram-bot-api": "^0.64.14",
