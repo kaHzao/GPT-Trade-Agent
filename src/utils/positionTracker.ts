@@ -4,6 +4,7 @@ import { logger } from './logger';
 import { sendAlert } from './telegram';
 import { recordSL, recordTP } from './riskGuard';
 import { config } from './config';
+import { logTrade } from './tradeLog';
 import type { Asset } from './config';
 
 const TRACKER_FILE = path.join(process.cwd(), 'positions-tracker.json');
@@ -33,14 +34,10 @@ function writeTracker(state: TrackerState) {
   fs.writeFileSync(TRACKER_FILE, JSON.stringify(state, null, 2));
 }
 
-// ─── Detect close reason dari market price ────────────────────────────────────
-// Sama dengan Claude agent — FIX sign SHORT yang benar
-
 function detectCloseReason(
   pos: TrackedPosition,
   lastPrice: number
 ): { closeReason: 'TP' | 'SL' | 'UNKNOWN'; pnlUsd: number | null } {
-
   if (!pos.slPrice || !pos.tpPrice || lastPrice <= 0) {
     return { closeReason: 'UNKNOWN', pnlUsd: null };
   }
@@ -72,8 +69,6 @@ function detectCloseReason(
   return { closeReason: 'UNKNOWN', pnlUsd: null };
 }
 
-// ─── Detect closed positions ──────────────────────────────────────────────────
-
 export async function detectClosedPositions(
   currentPositions: any[],
   marketPrices: Record<string, number> = {}
@@ -95,14 +90,16 @@ export async function detectClosedPositions(
     const lastPrice = marketPrices[pos.asset] ?? 0;
     const { closeReason, pnlUsd } = detectCloseReason(pos, lastPrice);
 
-    const duration    = Math.round((Date.now() - pos.openedAt) / 60_000);
-    const pnlStr      = pnlUsd !== null ? `${pnlUsd >= 0 ? '+' : ''}$${pnlUsd.toFixed(3)}` : 'N/A';
-    const pnlEmoji    = pnlUsd === null ? '❓' : pnlUsd >= 0 ? '✅' : '❌';
+    const now         = new Date();
+    const duration    = Math.round((now.getTime() - pos.openedAt) / 60_000);
+    const pnlFinal    = pnlUsd ?? -(config.trading.collateralUsdc * 0.015);
+    const pnlStr      = `${pnlFinal >= 0 ? '+' : ''}$${pnlFinal.toFixed(3)}`;
+    const pnlEmoji    = pnlFinal >= 0 ? '✅' : '❌';
     const sideEmoji   = pos.side === 'long' ? '🟢' : '🔴';
     const reasonEmoji = closeReason === 'TP' ? '🎯' : closeReason === 'SL' ? '🛑' : '📋';
 
     await sendAlert(
-      `${sideEmoji} *CLOSED: ${pos.asset} ${pos.side.toUpperCase()}* _(GPT)_\n` +
+      `${sideEmoji} *CLOSED: ${pos.asset} ${pos.side.toUpperCase()}*\n` +
       `${reasonEmoji} Reason: \`${closeReason}\`\n` +
       `Entry: \`$${pos.entryPrice.toLocaleString()}\`\n` +
       `Exit ~: \`$${lastPrice.toLocaleString()}\`\n` +
@@ -111,14 +108,32 @@ export async function detectClosedPositions(
       `Duration: \`${duration} min\``
     );
 
+    // ── Log ke trade-log.json ─────────────────────────────────────────────
+    logTrade({
+      id:          `${pos.openedAt}-${pos.asset}-${pos.side}`,
+      agent:       'gpt',
+      asset:       pos.asset,
+      side:        pos.side,
+      entryPrice:  pos.entryPrice,
+      exitPrice:   lastPrice,
+      entryTime:   new Date(pos.openedAt).toISOString(),
+      exitTime:    now.toISOString(),
+      durationMin: duration,
+      slPrice:     pos.slPrice ?? null,
+      tpPrice:     pos.tpPrice ?? null,
+      closeReason,
+      pnlUsd:      pnlFinal,
+      collateral:  config.trading.collateralUsdc,
+      leverage:    config.trading.leverage,
+    });
+
     const signal = pos.side === 'long' ? 'LONG' : 'SHORT';
     if (closeReason === 'SL') {
-      const loss = pnlUsd !== null ? Math.abs(pnlUsd) : config.trading.collateralUsdc * 0.015;
-      await recordSL(pos.asset as Asset, signal, loss);
+      await recordSL(pos.asset as Asset, signal, Math.abs(pnlFinal));
     } else if (closeReason === 'TP') {
       recordTP(pos.asset as Asset, signal);
     } else {
-      logger.warn(`${pos.asset} close UNKNOWN — assuming SL for safety`);
+      logger.warn(`${pos.asset} close UNKNOWN — assuming SL`);
       await recordSL(pos.asset as Asset, signal, config.trading.collateralUsdc * 0.015);
     }
 
@@ -127,8 +142,6 @@ export async function detectClosedPositions(
 
   writeTracker(state);
 }
-
-// ─── Update tracker ───────────────────────────────────────────────────────────
 
 export function updateTrackedPositions(currentPositions: any[]): void {
   const state = readTracker();
