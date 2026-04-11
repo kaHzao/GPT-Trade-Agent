@@ -53,7 +53,7 @@ async function fetchOHLCV(asset: Asset, tf: '30m' | '1h' | '4h', limit = 60): Pr
   const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
   if (!res.ok) throw new Error(`OKX API error: ${res.status}`);
 
-  const json = await res.json();
+  const json = await res.json() as any;
   if (json.code !== '0') throw new Error(`OKX error: ${json.msg}`);
 
   // OKX: terbaru → terlama, reverse + buang candle live
