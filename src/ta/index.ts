@@ -1,4 +1,3 @@
-import axios from 'axios';
 import { ATR } from 'technicalindicators';
 import { config, type Asset, ASSETS } from '../utils/config';
 import { logger } from '../utils/logger';
@@ -33,68 +32,73 @@ interface Candle {
   volume: number;
 }
 
-// ─── Fetch OHLCV ─────────────────────────────────────────────────────────────
+// ─── OKX symbol map ───────────────────────────────────────────────────────────
+
+const OKX_SYMBOL: Record<string, string> = {
+  SOL:  'SOL-USDT',
+  BTC:  'BTC-USDT',
+  WBTC: 'BTC-USDT',
+  ETH:  'ETH-USDT',
+};
+
+// ─── Fetch OHLCV dari OKX ─────────────────────────────────────────────────────
 
 async function fetchOHLCV(asset: Asset, tf: '30m' | '1h' | '4h', limit = 60): Promise<Candle[]> {
-  const endpoint  = tf === '30m' ? 'histominute' : 'histohour';
-  const aggregate = tf === '30m' ? 30 : tf === '1h' ? 1 : 4;
+  const instId = OKX_SYMBOL[asset];
+  if (!instId) throw new Error(`Unknown asset: ${asset}`);
 
-  const { data } = await axios.get(
-    `https://min-api.cryptocompare.com/data/${endpoint}`,
-    {
-      params:  { fsym: asset, tsym: 'USD', limit, aggregate, extraParams: 'gpt-trade-agent' },
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      timeout: 15_000,
-    }
-  );
+  const bar = tf === '30m' ? '30m' : tf === '1h' ? '1H' : '4H';
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${limit + 1}`;
 
-  if (data.Response === 'Error') throw new Error(data.Message);
-  return (data.Data || []).map((k: any) => ({
-    time:   k.time * 1000,
-    open:   k.open,
-    high:   k.high,
-    low:    k.low,
-    close:  k.close,
-    volume: k.volumeto,  // USD-denominated
-  }));
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+  if (!res.ok) throw new Error(`OKX API error: ${res.status}`);
+
+  const json = await res.json();
+  if (json.code !== '0') throw new Error(`OKX error: ${json.msg}`);
+
+  // OKX: terbaru → terlama, reverse + buang candle live
+  const candles = (json.data as string[][])
+    .reverse()
+    .slice(0, -1)
+    .map(k => ({
+      time:   parseInt(k[0]),
+      open:   parseFloat(k[1]),
+      high:   parseFloat(k[2]),
+      low:    parseFloat(k[3]),
+      close:  parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }));
+
+  return candles;
 }
 
 // ─── 1. MACRO BIAS — swing high/low dari N candle 4h ─────────────────────────
-// FIX: tidak lagi compare 1 candle saja
-// Logic: cari swing high dan swing low dari lookback terakhir,
-//        lalu bandingkan apakah HH/HL (bullish) atau LH/LL (bearish)
 
 function getMacroBias(c4h: Candle[]): 'BULLISH' | 'BEARISH' | 'NEUTRAL' {
   const n = config.ta.swingLookback;
   if (c4h.length < n + 2) return 'NEUTRAL';
 
-  const recent = c4h.slice(-(n + 1));  // n+1 candle terakhir
-  const prev   = c4h.slice(-(n * 2 + 1), -(n + 1)); // n+1 candle sebelumnya
+  const recent = c4h.slice(-(n + 1));
+  const prev   = c4h.slice(-(n * 2 + 1), -(n + 1));
 
   if (recent.length < 3 || prev.length < 3) return 'NEUTRAL';
 
-  // Swing high = max high dari window
   const recentHigh = Math.max(...recent.map(c => c.high));
   const prevHigh   = Math.max(...prev.map(c => c.high));
+  const recentLow  = Math.min(...recent.map(c => c.low));
+  const prevLow    = Math.min(...prev.map(c => c.low));
 
-  // Swing low = min low dari window
-  const recentLow = Math.min(...recent.map(c => c.low));
-  const prevLow   = Math.min(...prev.map(c => c.low));
+  const hh = recentHigh > prevHigh;
+  const hl  = recentLow  > prevLow;
+  const lh  = recentHigh < prevHigh;
+  const ll  = recentLow  < prevLow;
 
-  const hh = recentHigh > prevHigh;  // higher high
-  const hl  = recentLow  > prevLow;  // higher low
-  const lh  = recentHigh < prevHigh; // lower high
-  const ll  = recentLow  < prevLow;  // lower low
-
-  // Strict: butuh dua konfirmasi sekaligus
   if (hh && hl)  return 'BULLISH';
   if (lh && ll)  return 'BEARISH';
-
-  // Partial: satu konfirmasi = NEUTRAL (jangan force entry)
   return 'NEUTRAL';
 }
 
-// ─── 2. TREND STRENGTH — berapa persen candle 4h searah bias ─────────────────
+// ─── 2. TREND STRENGTH ────────────────────────────────────────────────────────
 
 function getTrendStrength(c4h: Candle[], bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL'): number {
   if (bias === 'NEUTRAL') return 0;
@@ -102,7 +106,7 @@ function getTrendStrength(c4h: Candle[], bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL'
   const aligned = recent.filter(c =>
     bias === 'BULLISH' ? c.close > c.open : c.close < c.open
   );
-  return aligned.length / recent.length; // 0.0 – 1.0
+  return aligned.length / recent.length;
 }
 
 // ─── 3. ATR ───────────────────────────────────────────────────────────────────
@@ -134,16 +138,13 @@ function getEntrySignal(c30m: Candle[]): { signal: Signal; reason: string; break
   const curr = c30m[c30m.length - 1];
   const prev = c30m[c30m.length - 2];
 
-  // Rata-rata body 10 candle terakhir
-  const avgBody = c30m.slice(-10).reduce((s, c) => s + Math.abs(c.close - c.open), 0) / 10;
-  const body    = Math.abs(curr.close - curr.open);
+  const avgBody  = c30m.slice(-10).reduce((s, c) => s + Math.abs(c.close - c.open), 0) / 10;
+  const body     = Math.abs(curr.close - curr.open);
   const strongBody = body >= avgBody * config.ta.bodyMultiplier;
 
-  // Breakout: close menembus high/low candle sebelumnya
   const bullBreak = curr.close > prev.high;
   const bearBreak = curr.close < prev.low;
 
-  // Breakout magnitude — seberapa jauh tembus
   const bullPct = bullBreak ? ((curr.close - prev.high) / prev.high) * 100 : 0;
   const bearPct = bearBreak ? ((prev.low - curr.close) / prev.low)  * 100 : 0;
 
@@ -165,16 +166,16 @@ function getEntrySignal(c30m: Candle[]): { signal: Signal; reason: string; break
   return { signal: 'HOLD', reason: 'No breakout', breakoutPct: 0 };
 }
 
-// ─── 6. MACRO FILTER — block signal yang melawan macro ───────────────────────
+// ─── 6. MACRO FILTER ─────────────────────────────────────────────────────────
 
 function applyMacroFilter(signal: Signal, macro: 'BULLISH' | 'BEARISH' | 'NEUTRAL'): Signal {
-  if (macro === 'NEUTRAL') return 'HOLD';  // FIX: NEUTRAL = tidak ada bias = jangan entry
+  if (macro === 'NEUTRAL') return 'HOLD';
   if (macro === 'BEARISH' && signal === 'LONG')  return 'HOLD';
   if (macro === 'BULLISH' && signal === 'SHORT') return 'HOLD';
   return signal;
 }
 
-// ─── 7. SL/TP — FIX: pakai ATR dari 1h, bukan 30m ───────────────────────────
+// ─── 7. SL/TP — ATR dari 1h ──────────────────────────────────────────────────
 
 function getSLTP(price: number, atr1h: number, signal: Signal) {
   const slDist = atr1h * config.ta.atrMultiplier;
@@ -186,41 +187,25 @@ function getSLTP(price: number, atr1h: number, signal: Signal) {
 }
 
 // ─── 8. CONFIDENCE ───────────────────────────────────────────────────────────
-// FIX: tidak lagi mulai dari 40 — setiap poin harus earned
-//
-// Max 100:
-//   Macro kuat (HH+HL / LH+LL)   : 30 pts
-//   Trend strength (% candle align): 20 pts max
-//   Breakout magnitude             : 15 pts max
-//   Vol dalam range bagus          : 15 pts
-//   Strong body breakout           : 10 pts
-//   Macro tidak NEUTRAL            : 10 pts (sudah difilter, tapi untuk scoring)
 
 function getConfidence(
   macro:       'BULLISH' | 'BEARISH' | 'NEUTRAL',
-  trendStr:    number,   // 0.0 – 1.0
+  trendStr:    number,
   volValid:    boolean,
   breakoutPct: number,
   strongBody:  boolean,
 ): number {
   let score = 0;
 
-  // Macro confirmation
   if (macro !== 'NEUTRAL') score += 30;
-
-  // Trend strength: 0.5 → 10pts, 0.75 → 15pts, 1.0 → 20pts
   score += Math.round(trendStr * 20);
 
-  // Breakout magnitude: 0.1% → 5pts, 0.2% → 10pts, ≥0.3% → 15pts
   if (breakoutPct >= 0.3) score += 15;
   else if (breakoutPct >= 0.2) score += 10;
   else if (breakoutPct >= 0.1) score += 5;
 
-  // Volume dalam range ideal
-  if (volValid) score += 15;
-
-  // Strong body candle
-  if (strongBody) score += 10;
+  if (volValid)    score += 15;
+  if (strongBody)  score += 10;
 
   return Math.min(100, score);
 }
@@ -232,9 +217,9 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
     logger.info(`Analyzing ${asset}...`);
 
     const c30m = await fetchOHLCV(asset, '30m', 60);
-    await new Promise(r => setTimeout(r, 800));
-    const c1h  = await fetchOHLCV(asset, '1h',  60);  // FIX: tambah 1h yang benar
-    await new Promise(r => setTimeout(r, 800));
+    await new Promise(r => setTimeout(r, 500));
+    const c1h  = await fetchOHLCV(asset, '1h',  60);
+    await new Promise(r => setTimeout(r, 500));
     const c4h  = await fetchOHLCV(asset, '4h',  30);
 
     if (c30m.length < 20 || c1h.length < 20 || c4h.length < config.ta.swingLookback * 2 + 2) {
@@ -242,45 +227,38 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       return null;
     }
 
-    const price = c30m[c30m.length - 1].close;
+    // Pakai 1h close sebagai price reference — lebih stable dari 30m
+    const price = c1h[c1h.length - 1].close;
 
-    // ── Macro bias dari swing structure 4h ───────────────────────────────────
-    const macro     = getMacroBias(c4h);
-    const trendStr  = getTrendStrength(c4h, macro);
-    const trend4h   = macro;
-    const trend1h   = macro; // 1h akan dipakai untuk ATR, bias tetap dari 4h swing
+    const macro    = getMacroBias(c4h);
+    const trendStr = getTrendStrength(c4h, macro);
+    const trend4h  = macro;
+    const trend1h  = macro;
 
-    // ── Volatility filter dari 30m ───────────────────────────────────────────
-    const atr30m  = getATR(c30m);
+    const atr30m   = getATR(c30m);
     const volCheck = isValidVolatility(atr30m, price);
-    const volPct  = (atr30m / price * 100).toFixed(3);
+    const volPct   = (atr30m / price * 100).toFixed(3);
 
     if (!volCheck.ok) {
       logger.info(`${asset} → HOLD | ${volCheck.reason}`);
       return makeHold(asset, volCheck.reason, price, trend4h, trend1h, macro);
     }
 
-    // ── Macro gate: NEUTRAL = skip ────────────────────────────────────────────
     if (macro === 'NEUTRAL') {
-      const reason = `Macro NEUTRAL — tidak ada struktur jelas (swing ${config.ta.swingLookback} candle 4h)`;
+      const reason = `Macro NEUTRAL — tidak ada struktur jelas`;
       logger.info(`${asset} → HOLD | ${reason}`);
       return makeHold(asset, reason, price, trend4h, trend1h, macro);
     }
 
-    // ── Entry signal dari 30m breakout ───────────────────────────────────────
     const { signal: rawSignal, reason: entryReason, breakoutPct } = getEntrySignal(c30m);
-
-    // ── Apply macro filter ────────────────────────────────────────────────────
     const signal = applyMacroFilter(rawSignal, macro);
     const reason = signal !== rawSignal
       ? `${rawSignal} blocked — macro ${macro}, tidak searah`
       : entryReason;
 
-    // ── Confidence ────────────────────────────────────────────────────────────
-    const curr     = c30m[c30m.length - 1];
-    const prev     = c30m[c30m.length - 2];
-    const avgBody  = c30m.slice(-10).reduce((s, c) => s + Math.abs(c.close - c.open), 0) / 10;
-    const body     = Math.abs(curr.close - curr.open);
+    const curr       = c30m[c30m.length - 1];
+    const avgBody    = c30m.slice(-10).reduce((s, c) => s + Math.abs(c.close - c.open), 0) / 10;
+    const body       = Math.abs(curr.close - curr.open);
     const strongBody = body >= avgBody * config.ta.bodyMultiplier;
 
     const confidence = signal !== 'HOLD'
@@ -292,7 +270,6 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       `vol:${volPct}% | break:${breakoutPct.toFixed(3)}% | conf:${confidence}%`
     );
 
-    // ── Confidence gate ───────────────────────────────────────────────────────
     if (signal !== 'HOLD' && confidence < config.ta.minConfidence) {
       const r = `Confidence terlalu rendah (${confidence}% < ${config.ta.minConfidence}%)`;
       return makeHold(asset, r, price, trend4h, trend1h, macro, confidence);
@@ -302,7 +279,7 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       return makeHold(asset, reason, price, trend4h, trend1h, macro, confidence);
     }
 
-    // ── SL/TP: FIX — ATR dari 1h ─────────────────────────────────────────────
+    // ATR dari 1h — lebih lebar, hindari whipsaw
     const atr1h = getATR(c1h);
     const { sl, tp } = getSLTP(price, atr1h, signal);
 
@@ -317,14 +294,13 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
     const slPct = (slDist / price) * 100;
     const tpPct = (tpDist / price) * 100;
 
-    // ── R:R gate ──────────────────────────────────────────────────────────────
     if (rr < config.ta.minRR) {
       return makeHold(asset, `R:R ${rr.toFixed(2)} < ${config.ta.minRR}`, price, trend4h, trend1h, macro, confidence);
     }
 
     return {
       asset, signal, reason, confidence, currentPrice: price,
-      rsi15m: 50,    // GPT agent tidak pakai RSI, placeholder
+      rsi15m: 50,
       trend4h, trend1h,
       regime: 'TRENDING', adx: 0,
       suggestedSL: sl, suggestedTP: tp,
@@ -336,8 +312,6 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
     return null;
   }
 }
-
-// ─── Helper ───────────────────────────────────────────────────────────────────
 
 function makeHold(
   asset: Asset, reason: string, price: number,
