@@ -166,7 +166,10 @@ function detectBOSandCHoCH(candles: Candle[], swings: SwingPoint[]): {
   const lastLow  = lows[lows.length - 1];
   const prevLow  = lows[lows.length - 2];
 
-  const currClose = candles[candles.length - 1].close;
+  // Ambil 5 close terakhir untuk scan BOS/CHoCH — lebih persistent
+  // TradingView tetap tampilkan BOS walau harga sudah retrace kembali
+  const recentCloses = candles.slice(-5).map(c => c.close);
+  const currClose    = recentCloses[recentCloses.length - 1];
 
   // Label struktur swing — sama persis dengan label TradingView
   const highLabel = lastHigh.price > prevHigh.price ? 'HH'
@@ -193,21 +196,21 @@ function detectBOSandCHoCH(candles: Candle[], swings: SwingPoint[]): {
 
   if (structureTrend === 'UPTREND') {
     bias = 'BULLISH';
-    if (currClose > lastHigh.price) {
-      // Close melewati swing HIGH terakhir → BOS UP (bullish continuation)
+    // Scan 5 candle terakhir — BOS tetap valid walau harga sudah retrace (sesuai TV)
+    if (recentCloses.some(c => c > lastHigh.price)) {
       lastBOS = 'UP';
-    } else if (currClose < lastLow.price) {
-      // Close melewati swing LOW terakhir saat uptrend → CHoCH DOWN (potensi reversal bearish)
+    }
+    // CHoCH hanya pakai candle terbaru (reversal harus konfirmasi close sekarang)
+    if (currClose < lastLow.price) {
       lastCHoCH = 'DOWN';
       bias = 'BEARISH';
     }
   } else if (structureTrend === 'DOWNTREND') {
     bias = 'BEARISH';
-    if (currClose < lastLow.price) {
-      // Close melewati swing LOW terakhir → BOS DOWN (bearish continuation)
+    if (recentCloses.some(c => c < lastLow.price)) {
       lastBOS = 'DOWN';
-    } else if (currClose > lastHigh.price) {
-      // Close melewati swing HIGH terakhir saat downtrend → CHoCH UP (potensi reversal bullish)
+    }
+    if (currClose > lastHigh.price) {
       lastCHoCH = 'UP';
       bias = 'BULLISH';
     }
@@ -218,8 +221,11 @@ function detectBOSandCHoCH(candles: Candle[], swings: SwingPoint[]): {
 
 // ─── SMC: Detect Order Block ──────────────────────────────────────────────────
 // Order Block = candle terakhir sebelum impulse move yang kuat
-// Bullish OB = bearish candle sebelum rally kuat ke atas (demand zone)
-// Bearish OB = bullish candle sebelum drop kuat ke bawah (supply zone)
+// Bullish OB = bearish candle sebelum rally (demand zone)
+// Bearish OB = bullish candle sebelum drop  (supply zone)
+//
+// Zone pakai HIGH dan LOW candle (full range) — sesuai LuxAlgo TradingView
+// bukan hanya body (open/close) yang lebih sempit
 
 function detectOrderBlock(candles: Candle[], bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL'): OrderBlock | null {
   if (bias === 'NEUTRAL' || candles.length < 10) return null;
@@ -228,43 +234,36 @@ function detectOrderBlock(candles: Candle[], bias: 'BULLISH' | 'BEARISH' | 'NEUT
   const recent = candles.slice(-lookback);
 
   if (bias === 'BULLISH') {
-    // Cari bearish candle (close < open) yang diikuti rally kuat
     for (let i = recent.length - 3; i >= 1; i--) {
       const c = recent[i];
-      const isBearish = c.close < c.open;
-      if (!isBearish) continue;
+      if (c.close >= c.open) continue; // harus bearish candle
 
-      // Cek apakah diikuti 2 candle bullish kuat
       const next1 = recent[i + 1];
       const next2 = recent[i + 2];
       if (!next1 || !next2) continue;
 
-      const impulse = next1.close > next1.open && next2.close > next2.open;
-      if (impulse) {
+      if (next1.close > next1.open && next2.close > next2.open) {
         return {
-          top:    Math.max(c.open, c.close),
-          bottom: Math.min(c.open, c.close),
+          top:    c.high,   // full range (wick atas) — sesuai LuxAlgo
+          bottom: c.low,    // full range (wick bawah)
           type:   'BULLISH',
           index:  candles.length - lookback + i,
         };
       }
     }
   } else {
-    // Cari bullish candle (close > open) yang diikuti drop kuat
     for (let i = recent.length - 3; i >= 1; i--) {
       const c = recent[i];
-      const isBullish = c.close > c.open;
-      if (!isBullish) continue;
+      if (c.close <= c.open) continue; // harus bullish candle
 
       const next1 = recent[i + 1];
       const next2 = recent[i + 2];
       if (!next1 || !next2) continue;
 
-      const impulse = next1.close < next1.open && next2.close < next2.open;
-      if (impulse) {
+      if (next1.close < next1.open && next2.close < next2.open) {
         return {
-          top:    Math.max(c.open, c.close),
-          bottom: Math.min(c.open, c.close),
+          top:    c.high,   // full range
+          bottom: c.low,
           type:   'BEARISH',
           index:  candles.length - lookback + i,
         };
@@ -285,9 +284,8 @@ function analyzeSMC(candles4h: Candle[], currentPrice: number): SMCBias {
   // Cek apakah harga sedang di dalam order block zone
   let inOBZone = false;
   if (orderBlock) {
-    const buffer = (orderBlock.top - orderBlock.bottom) * 0.2;
-    inOBZone = currentPrice >= orderBlock.bottom - buffer &&
-               currentPrice <= orderBlock.top + buffer;
+    // OB zone sudah pakai full range (high/low) — tidak perlu tambah buffer lagi
+    inOBZone = currentPrice >= orderBlock.bottom && currentPrice <= orderBlock.top;
   }
 
   return { bias, lastBOS, lastCHoCH, orderBlock, inOBZone, structureLabel };

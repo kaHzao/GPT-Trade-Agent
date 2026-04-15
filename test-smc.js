@@ -89,15 +89,19 @@ async function analyze(asset) {
   else if (isHH || isHL) trend = 'UPTREND (partial)';
   else if (isLH || isLL) trend = 'DOWNTREND (partial)';
 
+  // Scan 5 candle terakhir untuk BOS (persistent, sesuai TV)
+  const recentCloses = c4h.slice(-5).map(c => c.close);
+  const currClose    = recentCloses[recentCloses.length - 1];
+
   let bos = 'none', choch = 'none', bias = 'NEUTRAL';
   if (trend.startsWith('UPTREND')) {
     bias = 'BULLISH';
-    if (price > lH.price)     { bos = 'UP'; }
-    else if (price < lL.price) { choch = 'DOWN'; bias = 'BEARISH'; }
+    if (recentCloses.some(c => c > lH.price)) { bos = 'UP'; }
+    if (currClose < lL.price) { choch = 'DOWN'; bias = 'BEARISH'; }
   } else if (trend.startsWith('DOWNTREND')) {
     bias = 'BEARISH';
-    if (price < lL.price)     { bos = 'DOWN'; }
-    else if (price > lH.price) { choch = 'UP'; bias = 'BULLISH'; }
+    if (recentCloses.some(c => c < lL.price)) { bos = 'DOWN'; }
+    if (currClose > lH.price) { choch = 'UP'; bias = 'BULLISH'; }
   }
 
   console.log(`\n  ┌─ MARKET STRUCTURE ─────────────────────────────────┐`);
@@ -128,12 +132,12 @@ async function analyze(asset) {
     if (!n1 || !n2) continue;
     if (searchBullish) {
       if (c.close < c.open && n1.close > n1.open && n2.close > n2.open) {
-        ob = { top: Math.max(c.open, c.close), bottom: Math.min(c.open, c.close), type: 'BULLISH (demand)', time: c.time };
+        ob = { top: c.high, bottom: c.low, type: 'BULLISH (demand)', time: c.time }; // full range
         break;
       }
     } else {
       if (c.close > c.open && n1.close < n1.open && n2.close < n2.open) {
-        ob = { top: Math.max(c.open, c.close), bottom: Math.min(c.open, c.close), type: 'BEARISH (supply)', time: c.time };
+        ob = { top: c.high, bottom: c.low, type: 'BEARISH (supply)', time: c.time }; // full range
         break;
       }
     }
@@ -141,8 +145,7 @@ async function analyze(asset) {
 
   console.log(`\n  Order Block:`);
   if (ob) {
-    const buf = (ob.top - ob.bottom) * 0.2;
-    const inZone = price >= ob.bottom - buf && price <= ob.top + buf;
+    const inZone = price >= ob.bottom && price <= ob.top; // no extra buffer (full range sudah include wick)
     console.log(`    Type    : ${ob.type}`);
     console.log(`    Zone    : $${fmt(ob.bottom)} – $${fmt(ob.top)}`);
     console.log(`    Time    : ${dt(ob.time)}`);
