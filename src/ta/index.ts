@@ -12,6 +12,7 @@ export interface TAResult {
   confidence:   number;
   currentPrice: number;
   rsi15m:       number;
+  trend1d:      'BULLISH' | 'BEARISH' | 'NEUTRAL';
   trend4h:      'BULLISH' | 'BEARISH' | 'NEUTRAL';
   trend1h:      'BULLISH' | 'BEARISH' | 'NEUTRAL';
   regime:       MarketRegime;
@@ -45,13 +46,25 @@ interface OrderBlock {
   index:  number;
 }
 
+interface FVG {
+  top:    number;
+  bottom: number;
+  type:   'BULLISH' | 'BEARISH';
+  index:  number;
+}
+
 interface SMCBias {
-  bias:           'BULLISH' | 'BEARISH' | 'NEUTRAL';
-  lastBOS:        'UP' | 'DOWN' | null;
-  lastCHoCH:      'UP' | 'DOWN' | null;
-  orderBlock:     OrderBlock | null;
-  inOBZone:       boolean;
-  structureLabel: string; // e.g. "HH/HL", "LH/LL" — untuk debug vs TradingView
+  bias:            'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  lastBOS:         'UP' | 'DOWN' | null;
+  lastCHoCH:       'UP' | 'DOWN' | null;
+  orderBlock:      OrderBlock | null;
+  inOBZone:        boolean;
+  obMitigated:     boolean;
+  fvg:             FVG | null;
+  inFVGZone:       boolean;
+  structureLabel:  string;
+  premiumDiscount: 'PREMIUM' | 'DISCOUNT' | 'EQUILIBRIUM';
+  pdPct:           number;
 }
 
 // ─── OKX symbol map ───────────────────────────────────────────────────────────
@@ -65,11 +78,11 @@ const OKX_SYMBOL: Record<string, string> = {
 
 // ─── Fetch OHLCV dari OKX ─────────────────────────────────────────────────────
 
-async function fetchOHLCV(asset: Asset, tf: '30m' | '1h' | '4h', limit = 60): Promise<Candle[]> {
+async function fetchOHLCV(asset: Asset, tf: '30m' | '1h' | '4h' | '1d', limit = 60): Promise<Candle[]> {
   const instId = OKX_SYMBOL[asset];
   if (!instId) throw new Error(`Unknown asset: ${asset}`);
 
-  const bar = tf === '30m' ? '30m' : tf === '1h' ? '1H' : '4H';
+  const bar = tf === '30m' ? '30m' : tf === '1h' ? '1H' : tf === '4h' ? '4H' : '1D';
   const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${limit + 1}`;
 
   const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
@@ -274,21 +287,115 @@ function detectOrderBlock(candles: Candle[], bias: 'BULLISH' | 'BEARISH' | 'NEUT
   return null;
 }
 
+// ─── SMC: OB Mitigation check ─────────────────────────────────────────────────
+// OB yang sudah pernah disentuh harga = "mitigated" = tidak valid lagi
+// Jangan entry di OB bekas — smart money sudah tidak ada di sana
+
+function isOBMitigated(candles: Candle[], ob: OrderBlock): boolean {
+  for (let i = ob.index + 3; i < candles.length; i++) {
+    const c = candles[i];
+    if (c.low <= ob.top && c.high >= ob.bottom) return true;
+  }
+  return false;
+}
+
+// ─── SMC: Fair Value Gap (FVG) ────────────────────────────────────────────────
+// FVG = imbalance 3 candle — harga bergerak terlalu cepat, meninggalkan "gap"
+// Bullish FVG: candle[i+1].low > candle[i-1].high  (gap ke atas)
+// Bearish FVG: candle[i+1].high < candle[i-1].low  (gap ke bawah)
+// Cari FVG terbaru yang BELUM terisi (unfilled) sesuai arah bias
+
+function detectFVG(candles: Candle[], bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL'): FVG | null {
+  if (bias === 'NEUTRAL') return null;
+
+  const lookback = Math.min(20, candles.length - 2);
+
+  for (let i = candles.length - 2; i >= candles.length - lookback; i--) {
+    if (i < 1) break;
+    const c1 = candles[i - 1];
+    const c3 = candles[i + 1];
+
+    if (bias === 'BULLISH' && c3.low > c1.high) {
+      // Bullish FVG: gap antara high c1 dan low c3
+      const fvg: FVG = { top: c3.low, bottom: c1.high, type: 'BULLISH', index: i };
+      let filled = false;
+      for (let j = i + 2; j < candles.length; j++) {
+        if (candles[j].low <= fvg.top && candles[j].high >= fvg.bottom) { filled = true; break; }
+      }
+      if (!filled) return fvg;
+    }
+
+    if (bias === 'BEARISH' && c3.high < c1.low) {
+      // Bearish FVG: gap antara low c1 dan high c3
+      const fvg: FVG = { top: c1.low, bottom: c3.high, type: 'BEARISH', index: i };
+      let filled = false;
+      for (let j = i + 2; j < candles.length; j++) {
+        if (candles[j].high >= fvg.bottom && candles[j].low <= fvg.top) { filled = true; break; }
+      }
+      if (!filled) return fvg;
+    }
+  }
+
+  return null;
+}
+
+// ─── SMC: Premium / Discount Zone ─────────────────────────────────────────────
+// Bagi range harga (high-low) menjadi 3 zona:
+//   PREMIUM  (atas 55%) = zona mahal  → hanya SELL
+//   DISCOUNT (bawah 45%) = zona murah → hanya BUY
+//   EQUILIBRIUM (45-55%) = zona tengah
+// Entry LONG di PREMIUM atau SHORT di DISCOUNT = melawan value = probabilitas rendah
+
+function getPremiumDiscountZone(
+  price: number,
+  swings: SwingPoint[],
+): { zone: 'PREMIUM' | 'DISCOUNT' | 'EQUILIBRIUM'; pct: number } {
+  const highs = swings.filter(s => s.type === 'HIGH');
+  const lows  = swings.filter(s => s.type === 'LOW');
+
+  if (highs.length === 0 || lows.length === 0) return { zone: 'EQUILIBRIUM', pct: 50 };
+
+  const rangeHigh = Math.max(...highs.slice(-3).map(s => s.price));
+  const rangeLow  = Math.min(...lows.slice(-3).map(s => s.price));
+  const range = rangeHigh - rangeLow;
+
+  if (range <= 0) return { zone: 'EQUILIBRIUM', pct: 50 };
+
+  const pct  = ((price - rangeLow) / range) * 100;
+  const zone = pct >= 55 ? 'PREMIUM' : pct <= 45 ? 'DISCOUNT' : 'EQUILIBRIUM';
+
+  return { zone, pct: Math.round(pct) };
+}
+
+// ─── SMC: 1D Macro Bias ───────────────────────────────────────────────────────
+// Filter utama: hanya trade kalau 4H searah dengan trend harian (1D)
+// Kalau 1D bullish tapi 4H bearish = kontra trend = skip atau kurangi confidence
+
+async function get1DBias(asset: Asset): Promise<'BULLISH' | 'BEARISH' | 'NEUTRAL'> {
+  const c1d = await fetchOHLCV(asset, '1d', 30);
+  if (c1d.length < 8) return 'NEUTRAL';
+  const swings = detectSwingPoints(c1d, 2); // strength=2 untuk daily (lebih lenient)
+  const { bias } = detectBOSandCHoCH(c1d, swings);
+  return bias;
+}
+
 // ─── SMC: Full analysis ───────────────────────────────────────────────────────
 
 function analyzeSMC(candles4h: Candle[], currentPrice: number): SMCBias {
-  const swings = detectSwingPoints(candles4h); // pakai config.ta.swingLookback
+  const swings = detectSwingPoints(candles4h);
   const { lastBOS, lastCHoCH, bias, structureLabel } = detectBOSandCHoCH(candles4h, swings);
-  const orderBlock = detectOrderBlock(candles4h, bias);
+  const orderBlock   = detectOrderBlock(candles4h, bias);
+  const obMitigated  = orderBlock ? isOBMitigated(candles4h, orderBlock) : false;
+  const fvg          = detectFVG(candles4h, bias);
+  const { zone: premiumDiscount, pct: pdPct } = getPremiumDiscountZone(currentPrice, swings);
 
-  // Cek apakah harga sedang di dalam order block zone
-  let inOBZone = false;
-  if (orderBlock) {
-    // OB zone sudah pakai full range (high/low) — tidak perlu tambah buffer lagi
-    inOBZone = currentPrice >= orderBlock.bottom && currentPrice <= orderBlock.top;
-  }
+  // OB zone hanya valid kalau belum mitigated
+  const inOBZone  = !!(orderBlock && !obMitigated &&
+                       currentPrice >= orderBlock.bottom && currentPrice <= orderBlock.top);
+  const inFVGZone = !!(fvg && currentPrice >= fvg.bottom && currentPrice <= fvg.top);
 
-  return { bias, lastBOS, lastCHoCH, orderBlock, inOBZone, structureLabel };
+  return { bias, lastBOS, lastCHoCH, orderBlock, inOBZone, obMitigated,
+           fvg, inFVGZone, structureLabel, premiumDiscount, pdPct };
 }
 
 // ─── Entry trigger dari 1h ────────────────────────────────────────────────────
@@ -361,32 +468,46 @@ function getEntryTrigger(c1h: Candle[], bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL')
 // ─── Confidence score ─────────────────────────────────────────────────────────
 
 function calcConfidence(
-  smc: SMCBias,
+  smc:          SMCBias,
   entryStrength: number,
-  volValid: boolean,
+  volValid:     boolean,
+  signal:       Signal,
+  bias1d:       'BULLISH' | 'BEARISH' | 'NEUTRAL',
 ): number {
   let score = 0;
 
-  // SMC bias strength
-  if (smc.bias !== 'NEUTRAL') score += 25;
+  // ── 1D alignment (±15 / -10) ──────────────────────────────────────────────
+  if (bias1d !== 'NEUTRAL') {
+    const aligned = (signal === 'LONG' && bias1d === 'BULLISH') ||
+                    (signal === 'SHORT' && bias1d === 'BEARISH');
+    score += aligned ? 15 : -10;
+  }
 
-  // BOS konfirmasi (trend berlanjut)
-  if (smc.lastBOS !== null) score += 20;
+  // ── 4H SMC structure ──────────────────────────────────────────────────────
+  if (smc.bias !== 'NEUTRAL')   score += 20; // bias clear
+  if (smc.lastBOS !== null)     score += 15; // BOS konfirmasi
+  if (smc.lastCHoCH !== null)   score += 10; // CHoCH signal
 
-  // CHoCH (reversal signal — bonus kalau fresh)
-  if (smc.lastCHoCH !== null) score += 10;
+  // ── Order Block (fresh only) ──────────────────────────────────────────────
+  if (smc.orderBlock && !smc.obMitigated) score += 10;
+  if (smc.inOBZone)                       score += 10;
 
-  // Order Block zone (high probability area)
-  if (smc.orderBlock !== null) score += 15;
-  if (smc.inOBZone) score += 10; // bonus kalau harga di OB zone
+  // ── Fair Value Gap ────────────────────────────────────────────────────────
+  if (smc.fvg)        score += 10; // FVG ada
+  if (smc.inFVGZone)  score += 5;  // harga tepat di FVG = prime entry
 
-  // Entry trigger strength dari 1h
-  score += Math.round(entryStrength * 0.2); // max 20 pts
+  // ── Premium / Discount zone ───────────────────────────────────────────────
+  const pdGood = (signal === 'LONG'  && smc.premiumDiscount === 'DISCOUNT') ||
+                 (signal === 'SHORT' && smc.premiumDiscount === 'PREMIUM');
+  const pdBad  = (signal === 'LONG'  && smc.premiumDiscount === 'PREMIUM') ||
+                 (signal === 'SHORT' && smc.premiumDiscount === 'DISCOUNT');
+  if (pdGood) score += 5;
+  if (pdBad)  score -= 10;
 
-  // Volatility ok
-  if (volValid) score += 0; // sudah difilter sebelumnya
+  // ── Entry trigger dari 1h (0-20 pts) ─────────────────────────────────────
+  score += Math.round(entryStrength * 0.2);
 
-  return Math.min(100, score);
+  return Math.min(100, Math.max(0, score));
 }
 
 // ─── SL/TP dari ATR 1h ────────────────────────────────────────────────────────
@@ -406,10 +527,13 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
   try {
     logger.info(`Analyzing ${asset}...`);
 
+    // Fetch semua timeframe — 1D untuk macro bias
+    const c1d  = await fetchOHLCV(asset, '1d',  30).catch(() => [] as any[]);
+    await new Promise(r => setTimeout(r, 400));
     const c4h  = await fetchOHLCV(asset, '4h',  50);
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 400));
     const c1h  = await fetchOHLCV(asset, '1h',  60);
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 400));
     const c30m = await fetchOHLCV(asset, '30m', 60);
 
     if (c4h.length < 20 || c1h.length < 20 || c30m.length < 20) {
@@ -419,6 +543,13 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
 
     const price = c1h[c1h.length - 1].close;
 
+    // 1D macro bias
+    let bias1d: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+    if (c1d.length >= 8) {
+      const sw1d = detectSwingPoints(c1d, 2);
+      bias1d = detectBOSandCHoCH(c1d, sw1d).bias;
+    }
+
     // Volatility filter dari 30m
     const atr30m   = getATR(c30m);
     const volValid = isValidVolatility(atr30m, price);
@@ -426,64 +557,64 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
     if (!volValid) {
       const pct = (atr30m / price * 100).toFixed(3);
       logger.info(`${asset} → HOLD | Vol invalid: ${pct}%`);
-      return makeHold(asset, `Vol invalid (${pct}%)`, price, 'NEUTRAL', 'NEUTRAL');
+      return makeHold(asset, `Vol invalid (${pct}%)`, price, bias1d, 'NEUTRAL', 'NEUTRAL');
     }
 
-    // SMC analysis dari 4h
+    // SMC 4H analysis
     const smc = analyzeSMC(c4h, price);
 
     logger.info(
-      `${asset} | struct:${smc.structureLabel} bias:${smc.bias} | ` +
-      `BOS:${smc.lastBOS || 'none'} | CHoCH:${smc.lastCHoCH || 'none'} | ` +
-      `OB:${smc.orderBlock ? smc.orderBlock.type : 'none'} | inOB:${smc.inOBZone}`
+      `${asset} | 1D:${bias1d} | struct:${smc.structureLabel} bias:${smc.bias} | ` +
+      `BOS:${smc.lastBOS || '-'} CHoCH:${smc.lastCHoCH || '-'} | ` +
+      `OB:${smc.orderBlock ? `${smc.orderBlock.type}${smc.obMitigated ? '[MIT]' : ''}` : '-'} inOB:${smc.inOBZone} | ` +
+      `FVG:${smc.fvg ? smc.fvg.type : '-'} inFVG:${smc.inFVGZone} | ` +
+      `PD:${smc.premiumDiscount}(${smc.pdPct}%)`
     );
 
     if (smc.bias === 'NEUTRAL') {
-      const reason = `SMC: No clear structure — waiting for BOS/CHoCH`;
+      return makeHold(asset, `SMC: No clear structure`, price, bias1d, 'NEUTRAL', 'NEUTRAL');
+    }
+
+    const signal: Signal = smc.bias === 'BULLISH' ? 'LONG' : 'SHORT';
+
+    // ── Hard filter: Premium/Discount conflict ────────────────────────────────
+    const pdConflict = (signal === 'LONG'  && smc.premiumDiscount === 'PREMIUM') ||
+                       (signal === 'SHORT' && smc.premiumDiscount === 'DISCOUNT');
+    if (pdConflict) {
+      const reason = `P/D conflict: ${signal} in ${smc.premiumDiscount}(${smc.pdPct}%) — wrong zone`;
       logger.info(`${asset} → HOLD | ${reason}`);
-      return makeHold(asset, reason, price, 'NEUTRAL', 'NEUTRAL');
+      return makeHold(asset, reason, price, bias1d, smc.bias as any, smc.bias as any);
     }
 
     // Entry trigger dari 1h
     const entry = getEntryTrigger(c1h, smc.bias);
 
     if (!entry.triggered) {
-      const reason = `SMC bias:${smc.bias} | ${entry.reason}`;
-      logger.info(`${asset} → HOLD | ${reason}`);
-      return makeHold(asset, reason, price,
-        smc.bias as 'BULLISH' | 'BEARISH' | 'NEUTRAL',
-        smc.bias as 'BULLISH' | 'BEARISH' | 'NEUTRAL'
-      );
+      return makeHold(asset, `${smc.bias} | ${entry.reason}`, price,
+        bias1d, smc.bias as any, smc.bias as any);
     }
 
-    const signal: Signal = smc.bias === 'BULLISH' ? 'LONG' : 'SHORT';
+    // Confidence dengan semua faktor baru
+    const confidence = calcConfidence(smc, entry.strength, volValid, signal, bias1d);
 
-    // Confidence
-    const confidence = calcConfidence(smc, entry.strength, volValid);
-
-    logger.info(`${asset} → ${signal} | conf:${confidence}% | ${entry.reason}`);
+    logger.info(
+      `${asset} → ${signal} | conf:${confidence}% | 1D:${bias1d} | ` +
+      `PD:${smc.premiumDiscount} | FVG:${smc.fvg ? 'YES' : 'no'} | ${entry.reason}`
+    );
 
     if (confidence < config.ta.minConfidence) {
-      const reason = `Confidence too low (${confidence}% < ${config.ta.minConfidence}%)`;
-      return makeHold(asset, reason, price,
-        smc.bias as 'BULLISH'|'BEARISH'|'NEUTRAL',
-        smc.bias as 'BULLISH'|'BEARISH'|'NEUTRAL',
-        confidence
-      );
+      return makeHold(asset, `Confidence ${confidence}% < ${config.ta.minConfidence}%`, price,
+        bias1d, smc.bias as any, smc.bias as any, confidence);
     }
 
     // SL/TP dari ATR 1h
     const atr1h = getATR(c1h);
     const { sl, tp } = getSLTP(price, atr1h, signal);
-
     const slDist = Math.abs(price - sl);
     const tpDist = Math.abs(price - tp);
 
     if (slDist <= 0 || tpDist <= 0) {
-      return makeHold(asset, 'Invalid SL/TP', price,
-        smc.bias as 'BULLISH'|'BEARISH'|'NEUTRAL',
-        smc.bias as 'BULLISH'|'BEARISH'|'NEUTRAL'
-      );
+      return makeHold(asset, 'Invalid SL/TP', price, bias1d, smc.bias as any, smc.bias as any);
     }
 
     const rr    = tpDist / slDist;
@@ -492,21 +623,22 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
 
     if (rr < config.ta.minRR) {
       return makeHold(asset, `R:R ${rr.toFixed(2)} < ${config.ta.minRR}`, price,
-        smc.bias as 'BULLISH'|'BEARISH'|'NEUTRAL',
-        smc.bias as 'BULLISH'|'BEARISH'|'NEUTRAL',
-        confidence
-      );
+        bias1d, smc.bias as any, smc.bias as any, confidence);
     }
 
-    const obInfo = smc.orderBlock
-      ? ` | OB:${smc.orderBlock.type} $${smc.orderBlock.bottom.toFixed(2)}-$${smc.orderBlock.top.toFixed(2)}${smc.inOBZone ? ' [IN ZONE]' : ''}`
+    const fvgInfo = smc.fvg
+      ? ` | FVG:${smc.fvg.type}[$${smc.fvg.bottom.toFixed(2)}-$${smc.fvg.top.toFixed(2)}]${smc.inFVGZone ? '[IN]' : ''}`
+      : '';
+    const obInfo = smc.orderBlock && !smc.obMitigated
+      ? ` | OB:$${smc.orderBlock.bottom.toFixed(2)}-$${smc.orderBlock.top.toFixed(2)}${smc.inOBZone ? '[IN]' : ''}`
       : '';
 
     return {
       asset, signal,
-      reason: `SMC ${smc.bias} | BOS:${smc.lastBOS || '-'} CHoCH:${smc.lastCHoCH || '-'}${obInfo} | ${entry.reason}`,
+      reason: `1D:${bias1d} SMC:${smc.structureLabel} ${smc.bias} BOS:${smc.lastBOS || '-'} CHoCH:${smc.lastCHoCH || '-'}${obInfo}${fvgInfo} PD:${smc.premiumDiscount} | ${entry.reason}`,
       confidence, currentPrice: price,
       rsi15m: 50,
+      trend1d: bias1d,
       trend4h: smc.bias as 'BULLISH'|'BEARISH'|'NEUTRAL',
       trend1h: smc.bias as 'BULLISH'|'BEARISH'|'NEUTRAL',
       regime: 'TRENDING', adx: 0,
@@ -521,14 +653,17 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
 }
 
 function makeHold(
-  asset: Asset, reason: string, price: number,
+  asset:   Asset,
+  reason:  string,
+  price:   number,
+  trend1d: 'BULLISH'|'BEARISH'|'NEUTRAL' = 'NEUTRAL',
   trend4h: 'BULLISH'|'BEARISH'|'NEUTRAL' = 'NEUTRAL',
   trend1h: 'BULLISH'|'BEARISH'|'NEUTRAL' = 'NEUTRAL',
   confidence = 0
 ): TAResult {
   return {
     asset, signal: 'HOLD', reason, confidence, currentPrice: price,
-    rsi15m: 50, trend4h, trend1h,
+    rsi15m: 50, trend1d, trend4h, trend1h,
     regime: 'SIDEWAYS', adx: 0,
     suggestedSL: 0, suggestedTP: 0, slPct: 0, tpPct: 0, rrRatio: 0,
   };
