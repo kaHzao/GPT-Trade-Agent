@@ -27,12 +27,12 @@ interface GuardState {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-export const COOLDOWN_HOURS       = 3;
-export const MAX_TRADES_PER_DAY   = 3;
-export const MAX_DAILY_LOSS       = 1.5;
-export const MAX_LOSS_PER_ASSET   = 0.6;
-export const MAX_CONSEC_LOSS      = 2;       // block after 2x SL berturut
-export const CONSEC_BLOCK_HOURS   = 24;      // block selama 24 jam
+export const COOLDOWN_HOURS       = 2;    // cooldown setelah SL (lama: 3h)
+export const MAX_TRADES_PER_DAY   = 4;    // max trade per asset/hari (lama: 3)
+export const MAX_DAILY_LOSS       = 1.5;  // total loss harian (tidak berubah)
+export const MAX_LOSS_PER_ASSET   = 0.6;  // loss per asset/hari (tidak berubah)
+export const MAX_CONSEC_LOSS      = 3;    // block setelah 3x SL berturut (lama: 2)
+export const CONSEC_BLOCK_HOURS   = 8;    // block 8 jam saja (lama: 24h)
 
 // ─── Read / Write ─────────────────────────────────────────────────────────────
 
@@ -48,13 +48,17 @@ function readGuard(): GuardState {
       // Keep consecutive loss state across days (tidak reset per hari)
       const newAssets: Record<string, AssetGuard> = {};
       for (const [asset, g] of Object.entries(state.assets)) {
+        const now = Date.now();
         newAssets[asset] = {
-          tradesToday: 0,
-          lossToday: 0,
-          longConsecLoss: g.longConsecLoss || 0,
-          shortConsecLoss: g.shortConsecLoss || 0,
-          longBlockedUntil: g.longBlockedUntil,
-          shortBlockedUntil: g.shortBlockedUntil,
+          tradesToday:      0,
+          lossToday:        0,
+          // Reset consecutive loss counter tiap hari baru
+          // Bug lama: counter terbawa → 1 SL kemarin + 1 SL hari ini = langsung block
+          longConsecLoss:   0,
+          shortConsecLoss:  0,
+          // Tapi tetap pertahankan block yang masih aktif (belum expired)
+          longBlockedUntil:  g.longBlockedUntil  && g.longBlockedUntil  > now ? g.longBlockedUntil  : undefined,
+          shortBlockedUntil: g.shortBlockedUntil && g.shortBlockedUntil > now ? g.shortBlockedUntil : undefined,
         };
       }
       return { date: today, assets: newAssets, totalLossToday: 0 };
