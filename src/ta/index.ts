@@ -417,16 +417,21 @@ function getEntryTrigger(c1h: Candle[], bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL')
   const body = Math.abs(curr.close - curr.open);
   const strongBody = body >= avgBody * config.ta.bodyMultiplier;
 
-  // Volume konfirmasi
-  const avgVol = c1h.slice(-11, -1).reduce((s, c) => s + c.volume, 0) / 10;
+  // Volume konfirmasi — minimum 0.8x sebagai hard gate
+  // Volume rendah = smart money tidak ikut = entry tidak valid
+  const avgVol  = c1h.slice(-11, -1).reduce((s, c) => s + c.volume, 0) / 10;
   const volRatio = avgVol > 0 ? curr.volume / avgVol : 0;
-  const volOk = volRatio >= 1.0;
+  const volOk    = volRatio >= 1.0;
+  const volMin   = volRatio >= config.ta.volMinRatio; // hard gate
+
+  if (!volMin) {
+    return { triggered: false, reason: `Volume too low (${volRatio.toFixed(2)}x < ${config.ta.volMinRatio}x)`, strength: 0 };
+  }
 
   if (bias === 'BULLISH') {
-    // Entry trigger: bullish candle + close di atas prev high
     const bullishCandle = curr.close > curr.open;
     const breakPrevHigh = curr.close > prev.high;
-    const pullbackEntry = curr.low <= prev.close && curr.close > prev.close; // pullback ke prev close lalu lanjut
+    const pullbackEntry = curr.low <= prev.close && curr.close > prev.close;
 
     if ((breakPrevHigh || pullbackEntry) && bullishCandle && strongBody) {
       const strength = Math.min(100,
@@ -484,9 +489,11 @@ function calcConfidence(
   }
 
   // ── 4H SMC structure ──────────────────────────────────────────────────────
-  if (smc.bias !== 'NEUTRAL')   score += 20; // bias clear
-  if (smc.lastBOS !== null)     score += 15; // BOS konfirmasi
-  if (smc.lastCHoCH !== null)   score += 10; // CHoCH signal
+  if (smc.bias !== 'NEUTRAL')  score += 20; // bias clear
+  if (smc.lastBOS !== null)    score += 15; // BOS konfirmasi
+  if (smc.lastCHoCH !== null)  score += 10; // CHoCH signal
+  // Tidak ada BOS maupun CHoCH = entry belum terkonfirmasi = penalti besar
+  if (smc.lastBOS === null && smc.lastCHoCH === null) score -= 15;
 
   // ── Order Block (fresh only) ──────────────────────────────────────────────
   if (smc.orderBlock && !smc.obMitigated) score += 10;

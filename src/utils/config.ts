@@ -30,10 +30,11 @@ export const config = {
     swingLookback: 3,   // bar kiri+kanan untuk swing detection (TV default: 3–5)
 
     // ── Breakout candle filter ────────────────────────────────────────────
-    bodyMultiplier: 1.0,  // body candle >= avg × 1.0 (tidak terlalu ketat)
+    bodyMultiplier: 1.0,   // body candle >= avg × 1.0
+    volMinRatio:    0.8,   // volume hard gate — minimum 0.8x rata-rata (baru)
 
     // ── Confidence & R:R ─────────────────────────────────────────────────
-    minConfidence: 65,   // naik dari 60
+    minConfidence: 70,   // naik dari 65 — lebih ketat
     minRR:         2.0,
   },
 };
