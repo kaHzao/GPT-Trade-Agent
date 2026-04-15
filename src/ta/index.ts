@@ -46,11 +46,12 @@ interface OrderBlock {
 }
 
 interface SMCBias {
-  bias:       'BULLISH' | 'BEARISH' | 'NEUTRAL';
-  lastBOS:    'UP' | 'DOWN' | null;
-  lastCHoCH:  'UP' | 'DOWN' | null;
-  orderBlock: OrderBlock | null;
-  inOBZone:   boolean;
+  bias:           'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  lastBOS:        'UP' | 'DOWN' | null;
+  lastCHoCH:      'UP' | 'DOWN' | null;
+  orderBlock:     OrderBlock | null;
+  inOBZone:       boolean;
+  structureLabel: string; // e.g. "HH/HL", "LH/LL" — untuk debug vs TradingView
 }
 
 // ─── OKX symbol map ───────────────────────────────────────────────────────────
@@ -110,25 +111,25 @@ function isValidVolatility(atr30m: number, price: number): boolean {
 }
 
 // ─── SMC: Detect swing highs and lows ────────────────────────────────────────
-// Swing high = candle high lebih tinggi dari N candle kiri dan kanan
-// Swing low  = candle low lebih rendah dari N candle kiri dan kanan
+// Swing high = candle high STRICTLY lebih tinggi dari N candle kiri dan kanan
+// Swing low  = candle low STRICTLY lebih rendah dari N candle kiri dan kanan
+// strength=3 → sama dengan TV SMC indicator default (length=3)
 
-function detectSwingPoints(candles: Candle[], strength = 2): SwingPoint[] {
+function detectSwingPoints(candles: Candle[], strength = config.ta.swingLookback): SwingPoint[] {
   const swings: SwingPoint[] = [];
 
   for (let i = strength; i < candles.length - strength; i++) {
     const curr = candles[i];
 
-    // Swing High
-    const isSwingHigh = candles.slice(i - strength, i).every(c => c.high <= curr.high) &&
-                        candles.slice(i + 1, i + strength + 1).every(c => c.high <= curr.high);
+    // Pakai < (strict) bukan <= agar tidak ada duplikat swing di harga yang sama
+    const isSwingHigh = candles.slice(i - strength, i).every(c => c.high < curr.high) &&
+                        candles.slice(i + 1, i + strength + 1).every(c => c.high < curr.high);
     if (isSwingHigh) {
       swings.push({ index: i, price: curr.high, type: 'HIGH' });
     }
 
-    // Swing Low
-    const isSwingLow = candles.slice(i - strength, i).every(c => c.low >= curr.low) &&
-                       candles.slice(i + 1, i + strength + 1).every(c => c.low >= curr.low);
+    const isSwingLow = candles.slice(i - strength, i).every(c => c.low > curr.low) &&
+                       candles.slice(i + 1, i + strength + 1).every(c => c.low > curr.low);
     if (isSwingLow) {
       swings.push({ index: i, price: curr.low, type: 'LOW' });
     }
@@ -138,75 +139,81 @@ function detectSwingPoints(candles: Candle[], strength = 2): SwingPoint[] {
 }
 
 // ─── SMC: Detect BOS dan CHoCH ───────────────────────────────────────────────
-// BOS = Break of Structure (konfirmasi trend berlanjut)
-// CHoCH = Change of Character (sinyal reversal awal)
+// BOS   = Break of Structure → break SEARAH trend (konfirmasi continuation)
+// CHoCH = Change of Character → break BERLAWANAN trend (sinyal reversal)
+//
+// Logika benar (sesuai TradingView SMC):
+//   UPTREND   (HH+HL): BOS UP   = close > lastHigh | CHoCH DOWN = close < lastLow
+//   DOWNTREND (LH+LL): BOS DOWN = close < lastLow  | CHoCH UP   = close > lastHigh
 
 function detectBOSandCHoCH(candles: Candle[], swings: SwingPoint[]): {
-  lastBOS: 'UP' | 'DOWN' | null;
-  lastCHoCH: 'UP' | 'DOWN' | null;
-  bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  lastBOS:        'UP' | 'DOWN' | null;
+  lastCHoCH:      'UP' | 'DOWN' | null;
+  bias:           'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  structureLabel: string;
 } {
-  if (swings.length < 4) {
-    return { lastBOS: null, lastCHoCH: null, bias: 'NEUTRAL' };
-  }
+  const empty = { lastBOS: null as null, lastCHoCH: null as null, bias: 'NEUTRAL' as const, structureLabel: '??/??' };
 
-  let lastBOS: 'UP' | 'DOWN' | null = null;
-  let lastCHoCH: 'UP' | 'DOWN' | null = null;
-  let bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+  if (swings.length < 4) return empty;
 
   const highs = swings.filter(s => s.type === 'HIGH');
   const lows  = swings.filter(s => s.type === 'LOW');
 
-  if (highs.length < 2 || lows.length < 2) {
-    return { lastBOS, lastCHoCH, bias };
-  }
+  if (highs.length < 2 || lows.length < 2) return empty;
 
-  // Ambil 2 swing high dan low terakhir
-  const lastHigh  = highs[highs.length - 1];
-  const prevHigh  = highs[highs.length - 2];
-  const lastLow   = lows[lows.length - 1];
-  const prevLow   = lows[lows.length - 2];
+  const lastHigh = highs[highs.length - 1];
+  const prevHigh = highs[highs.length - 2];
+  const lastLow  = lows[lows.length - 1];
+  const prevLow  = lows[lows.length - 2];
 
   const currClose = candles[candles.length - 1].close;
 
-  // BOS Bullish: harga tembus swing high sebelumnya
-  if (currClose > prevHigh.price) {
-    lastBOS = 'UP';
-    bias = 'BULLISH';
-  }
-  // BOS Bearish: harga tembus swing low sebelumnya
-  else if (currClose < prevLow.price) {
-    lastBOS = 'DOWN';
-    bias = 'BEARISH';
-  }
+  // Label struktur swing — sama persis dengan label TradingView
+  const highLabel = lastHigh.price > prevHigh.price ? 'HH'
+                  : lastHigh.price < prevHigh.price ? 'LH' : 'EH';
+  const lowLabel  = lastLow.price  > prevLow.price  ? 'HL'
+                  : lastLow.price  < prevLow.price  ? 'LL' : 'EL';
+  const structureLabel = `${highLabel}/${lowLabel}`;
 
-  // CHoCH: perubahan arah — higher high gagal atau lower low gagal
-  // Bullish CHoCH: sebelumnya bearish (LH/LL), sekarang buat HL
-  if (lastLow.price > prevLow.price && lastHigh.price < prevHigh.price) {
-    // Struktur mixed — possible CHoCH bullish (HL terbentuk meski LH)
-    if (lastLow.price > prevLow.price) {
+  // Tentukan trend dominan dari struktur swing
+  const isHH = lastHigh.price > prevHigh.price;
+  const isHL  = lastLow.price  > prevLow.price;
+  const isLH  = lastHigh.price < prevHigh.price;
+  const isLL  = lastLow.price  < prevLow.price;
+
+  let structureTrend: 'UPTREND' | 'DOWNTREND' | 'NEUTRAL' = 'NEUTRAL';
+  if      (isHH && isHL)  structureTrend = 'UPTREND';   // HH+HL = uptrend penuh
+  else if (isLH && isLL)  structureTrend = 'DOWNTREND'; // LH+LL = downtrend penuh
+  else if (isHH || isHL)  structureTrend = 'UPTREND';   // partial bullish
+  else if (isLH || isLL)  structureTrend = 'DOWNTREND'; // partial bearish
+
+  let lastBOS:   'UP' | 'DOWN' | null = null;
+  let lastCHoCH: 'UP' | 'DOWN' | null = null;
+  let bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+
+  if (structureTrend === 'UPTREND') {
+    bias = 'BULLISH';
+    if (currClose > lastHigh.price) {
+      // Close melewati swing HIGH terakhir → BOS UP (bullish continuation)
+      lastBOS = 'UP';
+    } else if (currClose < lastLow.price) {
+      // Close melewati swing LOW terakhir saat uptrend → CHoCH DOWN (potensi reversal bearish)
+      lastCHoCH = 'DOWN';
+      bias = 'BEARISH';
+    }
+  } else if (structureTrend === 'DOWNTREND') {
+    bias = 'BEARISH';
+    if (currClose < lastLow.price) {
+      // Close melewati swing LOW terakhir → BOS DOWN (bearish continuation)
+      lastBOS = 'DOWN';
+    } else if (currClose > lastHigh.price) {
+      // Close melewati swing HIGH terakhir saat downtrend → CHoCH UP (potensi reversal bullish)
       lastCHoCH = 'UP';
-      if (bias === 'NEUTRAL') bias = 'BULLISH';
+      bias = 'BULLISH';
     }
   }
-  // Bearish CHoCH: sebelumnya bullish (HH/HL), sekarang buat LH
-  else if (lastHigh.price < prevHigh.price && lastLow.price < prevLow.price) {
-    lastCHoCH = 'DOWN';
-    if (bias === 'NEUTRAL') bias = 'BEARISH';
-  }
 
-  // Fallback: pakai HH/HL vs LH/LL sederhana
-  if (bias === 'NEUTRAL') {
-    const hh = lastHigh.price > prevHigh.price;
-    const hl = lastLow.price > prevLow.price;
-    const lh = lastHigh.price < prevHigh.price;
-    const ll = lastLow.price < prevLow.price;
-
-    if (hh && hl) bias = 'BULLISH';
-    else if (lh && ll) bias = 'BEARISH';
-  }
-
-  return { lastBOS, lastCHoCH, bias };
+  return { lastBOS, lastCHoCH, bias, structureLabel };
 }
 
 // ─── SMC: Detect Order Block ──────────────────────────────────────────────────
@@ -271,19 +278,19 @@ function detectOrderBlock(candles: Candle[], bias: 'BULLISH' | 'BEARISH' | 'NEUT
 // ─── SMC: Full analysis ───────────────────────────────────────────────────────
 
 function analyzeSMC(candles4h: Candle[], currentPrice: number): SMCBias {
-  const swings = detectSwingPoints(candles4h, 2);
-  const { lastBOS, lastCHoCH, bias } = detectBOSandCHoCH(candles4h, swings);
+  const swings = detectSwingPoints(candles4h); // pakai config.ta.swingLookback
+  const { lastBOS, lastCHoCH, bias, structureLabel } = detectBOSandCHoCH(candles4h, swings);
   const orderBlock = detectOrderBlock(candles4h, bias);
 
   // Cek apakah harga sedang di dalam order block zone
   let inOBZone = false;
   if (orderBlock) {
-    const buffer = (orderBlock.top - orderBlock.bottom) * 0.2; // 20% buffer
+    const buffer = (orderBlock.top - orderBlock.bottom) * 0.2;
     inOBZone = currentPrice >= orderBlock.bottom - buffer &&
                currentPrice <= orderBlock.top + buffer;
   }
 
-  return { bias, lastBOS, lastCHoCH, orderBlock, inOBZone };
+  return { bias, lastBOS, lastCHoCH, orderBlock, inOBZone, structureLabel };
 }
 
 // ─── Entry trigger dari 1h ────────────────────────────────────────────────────
@@ -428,8 +435,9 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
     const smc = analyzeSMC(c4h, price);
 
     logger.info(
-      `${asset} | SMC bias:${smc.bias} | BOS:${smc.lastBOS || 'none'} | ` +
-      `CHoCH:${smc.lastCHoCH || 'none'} | OB:${smc.orderBlock ? smc.orderBlock.type : 'none'} | inOB:${smc.inOBZone}`
+      `${asset} | struct:${smc.structureLabel} bias:${smc.bias} | ` +
+      `BOS:${smc.lastBOS || 'none'} | CHoCH:${smc.lastCHoCH || 'none'} | ` +
+      `OB:${smc.orderBlock ? smc.orderBlock.type : 'none'} | inOB:${smc.inOBZone}`
     );
 
     if (smc.bias === 'NEUTRAL') {

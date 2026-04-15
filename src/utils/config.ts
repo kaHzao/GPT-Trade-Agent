@@ -27,7 +27,7 @@ export const config = {
     volMaxPct: 0.025,  // terlalu liar = skip
 
     // ── Market structure ──────────────────────────────────────────────────
-    swingLookback: 6,   // jumlah candle 4h untuk detect swing high/low
+    swingLookback: 3,   // bar kiri+kanan untuk swing detection (TV default: 3–5)
 
     // ── Breakout candle filter ────────────────────────────────────────────
     bodyMultiplier: 1.0,  // body candle >= avg × 1.0 (tidak terlalu ketat)
