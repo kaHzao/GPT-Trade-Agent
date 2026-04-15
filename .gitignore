@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.env
+.env
+.env.local
+risk-guard.json
+positions-tracker.json
+trade-log.json
+*.log
